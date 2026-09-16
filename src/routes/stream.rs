@@ -98,13 +98,32 @@ async fn is_file_fully_downloaded(state: &AppState, info_hash: &str, file_path: 
 
 fn sanitize_for_filename(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
         .collect()
 }
 
+// ffmpeg picks its output muxer from the destination filename's extension,
+// so this must end in exactly one, valid extension -- `file_path`'s own
+// (sanitized) stem already carries the source's extension as literal text,
+// so the stem is stripped first to avoid ending up with e.g. "...mkv.mkv".
 fn remux_cache_path(state: &AppState, info_hash: &str, file_path: &str, ext: &str) -> std::path::PathBuf {
-    let filename = format!("{}_{}.{}", info_hash.to_lowercase(), sanitize_for_filename(file_path), ext);
+    let stem = std::path::Path::new(file_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file_path);
+    let filename = format!("{}_{}.{}", info_hash.to_lowercase(), sanitize_for_filename(stem), ext);
     std::path::Path::new(&state.config.remux_cache_dir).join(filename)
+}
+
+// Explicit muxer, rather than relying on ffmpeg to guess it from the
+// destination extension -- more robust, and independent of the extension
+// logic above.
+fn muxer_for_ext(ext: &str) -> &'static str {
+    match ext {
+        "mp4" | "m4v" | "mov" => "mp4",
+        "webm" => "webm",
+        _ => "matroska", // mkv, and a safe general-purpose fallback for anything else
+    }
 }
 
 // Remuxes in the background: video is stream-copied (no re-encode, fast) and
@@ -113,10 +132,15 @@ fn remux_cache_path(state: &AppState, info_hash: &str, file_path: &str, ext: &st
 // half-written file. Only called once per (info_hash, file_path) at a time --
 // callers check/set `active_remuxes` first.
 async fn spawn_background_remux(state: AppState, source: std::path::PathBuf, dest: std::path::PathBuf, guard_key: String) {
-    let tmp_dest = dest.with_extension(format!(
-        "{}.tmp",
-        dest.extension().and_then(|e| e.to_str()).unwrap_or("mp4")
-    ));
+    // Plain string suffix, not PathBuf::with_extension() -- these filenames
+    // already contain dots from the original release name, and
+    // with_extension() replaces everything after the *last* dot, which
+    // previously produced double extensions like "...mkv.mkv.tmp" that
+    // ffmpeg's muxer sniffing couldn't recognize.
+    let mut tmp_dest = dest.clone().into_os_string();
+    tmp_dest.push(".tmp");
+    let tmp_dest = std::path::PathBuf::from(tmp_dest);
+    let muxer = muxer_for_ext(dest.extension().and_then(|e| e.to_str()).unwrap_or("mkv"));
 
     log::info!("Starting background audio remux: {:?} -> {:?}", source, dest);
 
@@ -137,6 +161,7 @@ async fn spawn_background_remux(state: AppState, source: std::path::PathBuf, des
         .arg("-map").arg("0:a:0")
         .arg("-c:v").arg("copy")
         .arg("-c:a").arg("aac")
+        .arg("-f").arg(muxer)
         .arg(&tmp_dest)
         .output()
         .await;
