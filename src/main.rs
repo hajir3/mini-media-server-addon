@@ -51,6 +51,7 @@ async fn main() {
         http_client: Client::builder().build().unwrap(),
         db: Arc::new(db),
         admin_session_token: uuid::Uuid::new_v4().to_string(),
+        active_remuxes: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     };
     
     // Spawn background retention worker

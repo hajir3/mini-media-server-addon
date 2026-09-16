@@ -13,6 +13,7 @@ pub struct Config {
     pub qbittorrent_password: String,
     pub download_path: String,
     pub retention_days: u64,
+    pub remux_cache_dir: String,
 }
 
 impl Config {
@@ -37,6 +38,11 @@ impl Config {
                 .unwrap_or_else(|_| "0".to_string())
                 .parse()
                 .unwrap_or(0),
+            // Where audio-incompatible files get remuxed to (video copy, audio ->
+            // AAC) so they're playable in browsers. Must be a writable path,
+            // separate from DOWNLOAD_PATH which is mounted read-only.
+            remux_cache_dir: env::var("REMUX_CACHE_DIR")
+                .unwrap_or_else(|_| "./remux-cache".to_string()),
         }
     }
 }

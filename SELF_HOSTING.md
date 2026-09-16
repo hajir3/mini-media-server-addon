@@ -41,6 +41,7 @@ Here is a list of important environment variables you can configure (either via 
 - `QBITTORRENT_PASSWORD`: Password for qBittorrent WebUI.
 - `DOWNLOAD_PATH`: The directory path inside the addon container where downloaded torrents are located.
 - `RETENTION_DAYS`: (Optional) Number of days to keep a downloaded torrent before it is automatically deleted. `0` disables this feature (default: `0`).
+- `REMUX_CACHE_DIR`: (Optional) Directory the addon remuxes audio-incompatible files into (default: `./remux-cache`). Many torrent releases carry AC3/DTS audio, which browsers can't play natively — the addon detects this and re-encodes just the audio track to AAC (video is copied, not re-encoded) once a file finishes downloading, caching the result here. **Must be a writable path**, separate from `DOWNLOAD_PATH` (which should stay read-only).
 
 ## Running with Cargo (Local Development)
 

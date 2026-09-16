@@ -1,6 +1,26 @@
 use crate::routes::AppState;
 use std::time::Duration;
 
+// Cached remuxes (src/routes/stream.rs) are named "{hash}_<original filename>",
+// so they'd otherwise sit on disk forever once their source torrent is gone.
+async fn remove_cached_remuxes(remux_cache_dir: &str, hash: &str) {
+    let prefix = format!("{}_", hash.to_lowercase());
+    let mut entries = match tokio::fs::read_dir(remux_cache_dir).await {
+        Ok(entries) => entries,
+        Err(_) => return, // cache dir may not exist yet if nothing's ever been remuxed
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            if let Err(e) = tokio::fs::remove_file(entry.path()).await {
+                log::warn!("Failed to remove stale remux cache file {:?}: {}", entry.path(), e);
+            } else {
+                log::debug!("Removed stale remux cache file {:?}", entry.path());
+            }
+        }
+    }
+}
+
 pub fn start_retention_worker(state: AppState) {
     if state.config.retention_days > 0 {
         log::info!("Starting background retention worker (Policy: {} days inactivity before deletion)", state.config.retention_days);
@@ -48,6 +68,7 @@ pub fn start_retention_worker(state: AppState) {
                         stale_count += 1;
                         if retention_state.qbit.delete_torrent(&hash, true).await {
                             let _ = retention_state.db.delete_watch_history(&hash);
+                            remove_cached_remuxes(&retention_state.config.remux_cache_dir, &hash).await;
                         }
                     }
                 }

@@ -13,7 +13,8 @@ use crate::qbittorrent::QbitClient;
 use axum::Router;
 use axum::routing::get;
 use reqwest::Client;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
@@ -23,6 +24,9 @@ pub struct AppState {
     pub http_client: Client,
     pub db: Arc<crate::db::DbClient>,
     pub admin_session_token: String,
+    // Guards against launching duplicate concurrent ffmpeg remux jobs for the
+    // same output file (e.g. two players opening the same stream at once).
+    pub active_remuxes: Arc<Mutex<HashSet<String>>>,
 }
 
 pub fn create_router(state: AppState) -> Router {

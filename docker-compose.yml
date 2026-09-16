@@ -65,10 +65,13 @@ services:
       JACKETT_SEARCH_TYPE: "text" # 'imdb' or 'text'
       DOWNLOAD_PATH: "/downloads"
       RETENTION_DAYS: *retention_days
+      REMUX_CACHE_DIR: "/remux-cache"
     volumes:
       # Mount the same media_downloads volume to /downloads, but read-only!
       - mini_media_server_downloads:/downloads:ro
       - mini_media_server_addon_data:/app/data
+      # Writable -- audio-incompatible files get their audio remuxed to AAC here
+      - mini_media_server_remux_cache:/remux-cache
     # ports:
     #   - "7000:7000"
     restart: unless-stopped
@@ -80,6 +83,7 @@ volumes:
   mini_media_server_jackett_data:
   mini_media_server_qbittorrent_data:
   mini_media_server_addon_data:
+  mini_media_server_remux_cache:
   # example with external mounted hdd
   mini_media_server_downloads:
     driver: local
