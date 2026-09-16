@@ -14,10 +14,21 @@ struct MediaCompat {
     video_ok: bool,
     has_audio: bool,
     audio_ok: bool,
+    // Absolute ffprobe stream indices (not per-type indices), so ffmpeg can
+    // be told exactly which stream to copy/transcode with `-map 0:{index}`.
+    video_stream_index: Option<i64>,
+    audio_stream_index: Option<i64>,
 }
 
+// H.264 is universal; HEVC only decodes in Safari (Chrome/Firefox can't at
+// all -- a real, separate, unresolved gap: those files need a video
+// transcode, not just an audio fix, and aren't handled here yet). AV1/VP9/VP8
+// are natively supported in Chrome/Firefox and common in anime releases
+// ("[Group] Show [1080p BD AV1]") -- these were previously missing from this
+// list entirely, so such files skipped the audio-remux path too and always
+// played silently even though the video itself renders fine.
 fn is_compatible_video_codec(codec: &str) -> bool {
-    matches!(codec, "h264" | "hevc")
+    matches!(codec, "h264" | "hevc" | "av1" | "vp9" | "vp8")
 }
 
 // Browsers' native <video> element only decodes a handful of audio codecs.
@@ -33,12 +44,16 @@ async fn probe_compatibility(path: &std::path::Path) -> MediaCompat {
     cmd.arg("-v")
        .arg("error")
        .arg("-show_entries")
-       .arg("stream=codec_name,codec_type")
+       .arg("stream=index,codec_name,codec_type:stream_disposition=default")
        .arg("-of")
        .arg("json")
        .arg(path);
 
     let mut compat = MediaCompat::default();
+    // Multi-audio-track releases (common for anime: multiple dub languages)
+    // are common; fall back to the first audio stream seen if none is
+    // flagged `default` in the container.
+    let mut first_audio_stream_index: Option<i64> = None;
 
     match cmd.output().await {
         Ok(output) => {
@@ -51,8 +66,14 @@ async fn probe_compatibility(path: &std::path::Path) -> MediaCompat {
             if let Ok(json) = serde_json::from_slice::<Value>(&output.stdout) {
                 if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
                     for stream in streams {
+                        let index = stream.get("index").and_then(|s| s.as_i64());
                         let codec_type = stream.get("codec_type").and_then(|s| s.as_str());
                         let codec_name = stream.get("codec_name").and_then(|s| s.as_str());
+                        let is_default = stream
+                            .get("disposition")
+                            .and_then(|d| d.get("default"))
+                            .and_then(|v| v.as_i64())
+                            == Some(1);
 
                         match (codec_type, codec_name) {
                             (Some("video"), Some(name)) => {
@@ -61,6 +82,9 @@ async fn probe_compatibility(path: &std::path::Path) -> MediaCompat {
                                 if is_compatible_video_codec(name) {
                                     compat.video_ok = true;
                                 }
+                                if compat.video_stream_index.is_none() || is_default {
+                                    compat.video_stream_index = index;
+                                }
                             }
                             (Some("audio"), Some(name)) => {
                                 compat.has_audio = true;
@@ -68,9 +92,18 @@ async fn probe_compatibility(path: &std::path::Path) -> MediaCompat {
                                 if is_compatible_audio_codec(name) {
                                     compat.audio_ok = true;
                                 }
+                                if first_audio_stream_index.is_none() {
+                                    first_audio_stream_index = index;
+                                }
+                                if is_default {
+                                    compat.audio_stream_index = index;
+                                }
                             }
                             _ => {}
                         }
+                    }
+                    if compat.audio_stream_index.is_none() {
+                        compat.audio_stream_index = first_audio_stream_index;
                     }
                 } else {
                     log::warn!("ffprobe JSON output missing 'streams' array");
@@ -85,8 +118,9 @@ async fn probe_compatibility(path: &std::path::Path) -> MediaCompat {
     }
 
     log::info!(
-        "Probe result: has_video={}, video_ok={}, has_audio={}, audio_ok={}",
-        compat.has_video, compat.video_ok, compat.has_audio, compat.audio_ok
+        "Probe result: has_video={}, video_ok={}, has_audio={}, audio_ok={}, video_stream={:?}, audio_stream={:?}",
+        compat.has_video, compat.video_ok, compat.has_audio, compat.audio_ok,
+        compat.video_stream_index, compat.audio_stream_index
     );
     compat
 }
@@ -131,7 +165,14 @@ fn muxer_for_ext(ext: &str) -> &'static str {
 // atomically on success, so a concurrent request can never see a
 // half-written file. Only called once per (info_hash, file_path) at a time --
 // callers check/set `active_remuxes` first.
-async fn spawn_background_remux(state: AppState, source: std::path::PathBuf, dest: std::path::PathBuf, guard_key: String) {
+async fn spawn_background_remux(
+    state: AppState,
+    source: std::path::PathBuf,
+    dest: std::path::PathBuf,
+    guard_key: String,
+    video_stream_index: i64,
+    audio_stream_index: i64,
+) {
     // Plain string suffix, not PathBuf::with_extension() -- these filenames
     // already contain dots from the original release name, and
     // with_extension() replaces everything after the *last* dot, which
@@ -157,8 +198,8 @@ async fn spawn_background_remux(state: AppState, source: std::path::PathBuf, des
     let result = Command::new("ffmpeg")
         .arg("-y")
         .arg("-i").arg(&source)
-        .arg("-map").arg("0:v:0")
-        .arg("-map").arg("0:a:0")
+        .arg("-map").arg(format!("0:{}", video_stream_index))
+        .arg("-map").arg(format!("0:{}", audio_stream_index))
         .arg("-c:v").arg("copy")
         .arg("-c:a").arg("aac")
         .arg("-f").arg(muxer)
@@ -247,16 +288,20 @@ pub async fn stream_file(
 
                 if already_running {
                     log::info!("Audio remux already in progress for {:?}; serving without audio for now.", full_path);
-                } else if is_file_fully_downloaded(&state, &info_hash, &file_path).await {
+                } else if let (true, Some(video_idx), Some(audio_idx)) = (
+                    is_file_fully_downloaded(&state, &info_hash, &file_path).await,
+                    compat.video_stream_index,
+                    compat.audio_stream_index,
+                ) {
                     log::info!("Incompatible audio codec detected on a fully-downloaded file; starting background remux.");
-                    tokio::spawn(spawn_background_remux(state.clone(), full_path.clone(), cache_path, guard_key));
+                    tokio::spawn(spawn_background_remux(state.clone(), full_path.clone(), cache_path, guard_key, video_idx, audio_idx));
                 } else {
                     log::info!("Incompatible audio codec detected but file is still downloading; will remux once complete. Serving without audio for now.");
                     state.active_remuxes.lock().unwrap().remove(&guard_key);
                 }
             }
         } else if compat.has_video && compat.video_ok {
-            log::info!("File contains a compatible video format (H.264/HEVC) and compatible (or no) audio.");
+            log::info!("File contains a compatible video format and compatible (or no) audio.");
         } else {
             log::info!("File does not contain a compatible video format.");
         }
